@@ -2,18 +2,6 @@
 //1-D A, B, C on both GPU and CPU (use FP32)
 
 
-//CPU- reference implementation
-
-//GPU- one output element per thread (MODE==1) //this is the original in matrix_multiply.cu
-//GPU- one output element per thread with shared-memory tiling (MODE==4) //this is the original in matrix_multiply.cu
-
-//Transposed matrix B:
-//Same as MODE==1 above but matrix B is transposed (MODE==5)
-//Same as MODE==4 above but matrix B is transposed (MODE==6)
-
-//GPU- one element per thread but transpose matrix B so that we have more coalesced memory accesses (MODE==6)
-
-
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -26,13 +14,13 @@
 
 
 // Constants for LxM * MxN
-#define N 2048
-#define M 4096
-#define L 2048
+#define N 128
+#define M 128
+#define L 128
 
-#define MODE 1 //see implementations above for associated modes
+#define MODE 3 //see implementations above for associated modes
 
-// #define BLOCKDIMTILE 16
+#define BLOCKDIMTILE 8
 
 
 //Error checking GPU calls
@@ -63,6 +51,8 @@ void outputSumElems(float * C, unsigned int NUMELEM);
 // __global__ void matrixMultiOneElemPerThreadSharedMemoryTileTransposedB(float *A, float *B, float *C, const unsigned int NUMELEM);
 
 __global__ void matrixMultGeneralBaselineOneElemPerThread(float *A, float *B, float *C);
+__global__ void matrixMultGeneralBaselineOneElemPerThread2D(float *A, float *B, float *C);
+__global__ void matrixMultGeneralBaselineOneElemPerThread2DTile(float *A, float *B, float *C);
 
 int main(int argc, char *argv[])
 {
@@ -103,14 +93,14 @@ int main(int argc, char *argv[])
         // B_Transposed[(i / N) + (i % N) * N] = B[i];
   	}
 
-	printf("\nMemory requested for 5x NxN matrices (GiB) %f", (5.0*N*N*sizeof(float)/(1024.0*1024.0*1024.0)));
+	printf("\nMemory requested for 5x NxN matrices (GiB) %f", (5.0*L*N*sizeof(float)/(1024.0*1024.0*1024.0)));
 
 	///////////////////////////
 	//CPU version:
 	///////////////////////////
 
 	printf("\nCommented sequential CPU execution");
-	// computeMatrixCPU(A, B, C_CPU, N);
+	//computeMatrixCPU(A, B, C_CPU, N);
 
 	//print matrix if N is <= 10x10
 	printMatrixIfSmall(C_CPU, N, 0);
@@ -147,17 +137,15 @@ int main(int argc, char *argv[])
 	//copy A to device
 	gpuErrchk(cudaMemcpy(dev_A, A, sizeof(float)*L*M, cudaMemcpyHostToDevice));
 
-	//copy B to device (non-transposed)
-	if (MODE==1 || MODE==4)
-	{
-		gpuErrchk(cudaMemcpy(dev_B, B, sizeof(float)*M*N, cudaMemcpyHostToDevice));
-	}
-
 	//copy B to device (transposed)
-	else if (MODE==5 || MODE==6)
+	if (MODE==5 || MODE==6)
 	{
 		gpuErrchk(cudaMemcpy(dev_B, B_Transposed, sizeof(float)*N*M, cudaMemcpyHostToDevice));
 	}
+    else // Otherwise, copy B (non-transposed) to device
+    {
+		gpuErrchk(cudaMemcpy(dev_B, B, sizeof(float)*M*N, cudaMemcpyHostToDevice));
+    }
 
 	//copy C to device (initialized to 0)
 	gpuErrchk(cudaMemcpy(dev_C, C, sizeof(float)*L*N, cudaMemcpyHostToDevice));
@@ -165,17 +153,28 @@ int main(int argc, char *argv[])
 
 	//execute kernel
 
-	//MODE==1 refers to one thread per output element of the matrix
-	if (MODE==1){
-		printf("\nMODE==1");
+	if (MODE==1){ // 1D blocks/grids
+		printf("\nMODE == 1");
 		//set number of blocks -- for convenience, use 2-D grid to represent matrix elements
 		unsigned int BLOCKDIM = 1024;
-		dim3 dimGrid(ceil(N*L*1.0/BLOCKDIM*1.0), 1, 1);
-		dim3 dimBlock(BLOCKDIM, 1, 1);
 
-		matrixMultGeneralBaselineOneElemPerThread<<<dimGrid, dimBlock>>>(dev_A, dev_B, dev_C);
-
+		matrixMultGeneralBaselineOneElemPerThread<<<ceil(N*L*1.0/BLOCKDIM*1.0), BLOCKDIM>>>(dev_A, dev_B, dev_C);
 	}
+    else if(MODE == 2) { // 2D blocks/grids
+		printf("\nMODE == 2");
+        unsigned int BLOCKDIM = BLOCKDIMTILE;
+		dim3 dimGrid(ceil(N*1.0/BLOCKDIM*1.0), ceil(L*1.0/BLOCKDIM*1.0), 1);
+		dim3 dimBlock(BLOCKDIM, BLOCKDIM, 1);
+
+        matrixMultGeneralBaselineOneElemPerThread2D<<<dimGrid, dimBlock>>>(dev_A, dev_B, dev_C);
+    } else if(MODE == 3) {
+        printf("\nMODE == 3");
+        unsigned int BLOCKDIM = BLOCKDIMTILE;
+		dim3 dimGrid(ceil(N*1.0/BLOCKDIM*1.0), ceil(L*1.0/BLOCKDIM*1.0), 1);
+		dim3 dimBlock(BLOCKDIM, BLOCKDIM, 1);
+
+        matrixMultGeneralBaselineOneElemPerThread2DTile<<<dimGrid, dimBlock>>>(dev_A, dev_B, dev_C);
+    }
 	else if (MODE==4){
 		printf("\nMODE==4");
 		//set number of blocks -- for convenience, use 2-D grid to represent matrix elements
@@ -277,7 +276,7 @@ void compareMatrices(float * C_GPU, float * C_CPU, unsigned int NUMELEM)
 {
 	float sumDelta=0;
 	float maxDelta=0; //keep track of the maximum difference
-	for (int i=0; i<L*M; i++)
+	for (int i=0; i<L*N; i++)
 	{
 		float delta = fabs(C_CPU[i]-C_GPU[i]);
 		sumDelta += delta;
@@ -340,7 +339,6 @@ void printMatrixIfSmall(float * C, const unsigned int NUMELEM, bool CPUGPU)
 	}
 }
 
-//each thread computes a single element of C using a row of A and column of B
 __global__ void matrixMultGeneralBaselineOneElemPerThread(float *A, float *B, float *C)
 {
     unsigned int tid = threadIdx.x + (blockDim.x * blockIdx.x);
@@ -349,12 +347,65 @@ __global__ void matrixMultGeneralBaselineOneElemPerThread(float *A, float *B, fl
 
     if(tid < L * N)
     {
-        // printf("%u %u %d %u\n", ROW, COL, L * N, tid);
         for(int iter = 0; iter < M; iter++)
         {
             C[ROW*N+COL] += A[ROW*M+iter] * B[iter*N+COL];
         }
     }
+
+    return;
+}
+
+__global__ void matrixMultGeneralBaselineOneElemPerThread2D(float *A, float *B, float *C)
+{
+    unsigned int ROW = threadIdx.y+blockDim.y*blockIdx.y;
+    unsigned int COL = threadIdx.x+blockDim.x*blockIdx.x;
+
+    if(ROW < L && COL < N)
+    {
+        for (int k=0; k<M; k++)
+        {
+            C[ROW*N + COL]+=A[ROW*M + k]*B[k*N + COL];
+        }
+    }
+
+    return;
+}
+
+__global__ void matrixMultGeneralBaselineOneElemPerThread2DTile(float *A, float *B, float *C)
+{
+    int COL = threadIdx.y+(blockDim.y*blockIdx.y);
+    int ROW = threadIdx.x+(blockDim.x*blockIdx.x);
+    float localSum = 0.0;
+
+    __shared__ float tileA[BLOCKDIMTILE][BLOCKDIMTILE];
+    __shared__ float tileB[BLOCKDIMTILE][BLOCKDIMTILE];
+
+    for(int phase=0; phase<L*N; phase+=BLOCKDIMTILE)
+    {
+        if((ROW*M+phase+threadIdx.y) < L * M) {
+            tileA[threadIdx.x][threadIdx.y] = A[ROW*M+phase+threadIdx.y];
+        } else {
+            tileA[threadIdx.x][threadIdx.y] = 0.0;
+        }
+
+        if(((phase+threadIdx.x)*N + COL) < M * N) {
+            tileB[threadIdx.x][threadIdx.y] = B[(phase+threadIdx.x)*N + COL];
+        } else {
+            tileB[threadIdx.x][threadIdx.y] = 0.0;
+        }
+
+        __syncthreads();
+
+        for (int k=0; k<BLOCKDIMTILE; k++)
+        {
+            localSum+=tileA[threadIdx.x][k]*tileB[k][threadIdx.y];
+        }
+
+        __syncthreads();
+    }
+
+    C[ROW*N+COL] = localSum;
 
     return;
 }
